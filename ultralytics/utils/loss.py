@@ -126,57 +126,45 @@ class BboxLoss(nn.Module):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for bounding boxes.
+        """Compute IoU and DFL losses for bounding boxes."""
+        _mps = pred_bboxes.device.type == "mps"
+        if _mps:
+            # MPS: run original loss on CPU to avoid variable-shape MPS graph compilation.
+            _dev = pred_bboxes.device
+            # Autograd tracks the .cpu() transfer — gradients flow back to MPS automatically.
+            pred_dist = pred_dist.cpu()
+            pred_bboxes = pred_bboxes.cpu()
+            anchor_points = anchor_points.cpu()
+            target_bboxes = target_bboxes.cpu()
+            target_scores = target_scores.cpu()
+            target_scores_sum = target_scores_sum.cpu() if isinstance(target_scores_sum, torch.Tensor) else target_scores_sum
+            fg_mask = fg_mask.cpu()
+            imgsz = imgsz.cpu()
+            stride = stride.cpu()
 
-        On MPS, uses full-tensor computation to avoid variable-shape tensors that
-        pollute the MPS graph/MLIR/shader caches. On other devices, uses the original
-        boolean-indexed version which is more memory-efficient.
-        """
-        if pred_bboxes.device.type == "mps":
-            # MPS path: full-tensor, weight masks out non-fg positions
-            weight = target_scores.sum(-1, keepdim=True)  # (B, A, 1)
-            iou = bbox_iou(pred_bboxes, target_bboxes, xywh=False, CIoU=True)  # (B, A, 1)
-            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-        else:
-            # Original path: boolean-indexed
-            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-
-        # DFL loss
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            b, a, c = pred_dist.shape
-            if pred_bboxes.device.type == "mps":
-                weight_dfl = target_scores.sum(-1, keepdim=True)  # reuse full-tensor weight
-                loss_dfl = self.dfl_loss(
-                    pred_dist.view(-1, self.dfl_loss.reg_max), target_ltrb
-                ).view(b, a, -1) * weight_dfl  # (B, A, 1)
-                loss_dfl = loss_dfl.sum() / target_scores_sum
-            else:
-                loss_dfl = (
-                    self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask])
-                    * weight
-                ).sum() / target_scores_sum
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             target_ltrb = bbox2dist(anchor_points, target_bboxes)
-            # normalize ltrb by image size
             target_ltrb = target_ltrb * stride
             target_ltrb[..., 0::2] /= imgsz[1]
             target_ltrb[..., 1::2] /= imgsz[0]
             pred_dist = pred_dist * stride
             pred_dist[..., 0::2] /= imgsz[1]
             pred_dist[..., 1::2] /= imgsz[0]
-            if pred_bboxes.device.type == "mps":
-                weight_dfl = target_scores.sum(-1, keepdim=True)
-                loss_dfl = (
-                    F.l1_loss(pred_dist, target_ltrb, reduction="none").mean(-1, keepdim=True) * weight_dfl
-                )
-            else:
-                loss_dfl = (
-                    F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-                )
+            loss_dfl = (
+                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+            )
             loss_dfl = loss_dfl.sum() / target_scores_sum
+
+        if _mps:
+            loss_iou = loss_iou.to(_dev)
+            loss_dfl = loss_dfl.to(_dev)
 
         return loss_iou, loss_dfl
 
@@ -254,40 +242,32 @@ class RotatedBboxLoss(BboxLoss):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for rotated bounding boxes.
+        """Compute IoU and DFL losses for rotated bounding boxes."""
+        _mps = pred_bboxes.device.type == "mps"
+        if _mps:
+            _dev = pred_bboxes.device
+            # MPS: run original loss on CPU to avoid variable-shape MPS graph compilation.
+            pred_dist = pred_dist.cpu()
+            pred_bboxes = pred_bboxes.cpu()
+            anchor_points = anchor_points.cpu()
+            target_bboxes = target_bboxes.cpu()
+            target_scores = target_scores.cpu()
+            target_scores_sum = target_scores_sum.cpu() if isinstance(target_scores_sum, torch.Tensor) else target_scores_sum
+            fg_mask = fg_mask.cpu()
+            imgsz = imgsz.cpu()
+            stride = stride.cpu()
 
-        On MPS, uses full-tensor computation to avoid variable-shape tensors that
-        pollute the MPS graph/MLIR/shader caches. On other devices, uses the original
-        boolean-indexed version.
-        """
-        if pred_bboxes.device.type == "mps":
-            # MPS path: full-tensor
-            weight = target_scores.sum(-1, keepdim=True)  # (B, A, 1)
-            iou = probiou(pred_bboxes, target_bboxes)  # (B, A)
-            loss_iou = ((1.0 - iou).unsqueeze(-1) * weight).sum() / target_scores_sum
-        else:
-            # Original path: boolean-indexed
-            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-            iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
-            loss_iou = ((1.0 - iou).unsqueeze(-1) * weight).sum() / target_scores_sum
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
             target_ltrb = rbox2dist(
                 target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5], reg_max=self.dfl_loss.reg_max - 1
             )
-            b, a, c = pred_dist.shape
-            if pred_bboxes.device.type == "mps":
-                weight_dfl = target_scores.sum(-1, keepdim=True)
-                loss_dfl = self.dfl_loss(
-                    pred_dist.view(-1, self.dfl_loss.reg_max), target_ltrb
-                ).view(b, a, -1) * weight_dfl
-                loss_dfl = loss_dfl.sum() / target_scores_sum
-            else:
-                loss_dfl = (
-                    self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask])
-                    * weight
-                ).sum() / target_scores_sum
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             target_ltrb = rbox2dist(target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5])
             target_ltrb = target_ltrb * stride
@@ -296,16 +276,14 @@ class RotatedBboxLoss(BboxLoss):
             pred_dist = pred_dist * stride
             pred_dist[..., 0::2] /= imgsz[1]
             pred_dist[..., 1::2] /= imgsz[0]
-            if pred_bboxes.device.type == "mps":
-                weight_dfl = target_scores.sum(-1, keepdim=True)
-                loss_dfl = (
-                    F.l1_loss(pred_dist, target_ltrb, reduction="none").mean(-1, keepdim=True) * weight_dfl
-                )
-            else:
-                loss_dfl = (
-                    F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-                )
+            loss_dfl = (
+                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+            )
             loss_dfl = loss_dfl.sum() / target_scores_sum
+
+        if _mps:
+            loss_iou = loss_iou.to(_dev)
+            loss_dfl = loss_dfl.to(_dev)
 
         return loss_iou, loss_dfl
 
