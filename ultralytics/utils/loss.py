@@ -402,7 +402,7 @@ class v8DetectionLoss:
     # In MPS, for the second dimension of the targets tensor in preprocess(, using a single constant eliminates all shape variation from the loss computation path, which otherwise causes unbounded memory growth via MPSGraphCache / MLIR BumpPtrAllocator / Metal shader caches (1 per shape!) — none of which can be flushed before process termination. Extra slots are zero-padded and masked by mask_gt.
     # 512 should handle high after-mosaic-per-image ground truths.
 # it corresponds to the 'instances' indicator stat of training; a batch with an instances' count greater than that will create its own cache like before.
-    FIXED_MAX_BOXES = 512
+    # it corresponds to the 'instances' indicator stat of training; a batch with an instances' count greater than that will create its own cache like before.
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates.
