@@ -101,22 +101,23 @@ class DetectionValidator(BaseValidator):
     def get_desc(self) -> str:
         """Return a formatted string summarizing class metrics of YOLO model."""
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
-
     def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         """Apply Non-maximum suppression to prediction outputs.
-
         Args:
             preds (torch.Tensor): Raw predictions from the model.
-
         Returns:
             (list[dict[str, torch.Tensor]]): Processed predictions after NMS, where each dict contains 'bboxes', 'conf',
                 'cls', and 'extra' tensors.
         """
         # Move to CPU before NMS to avoid MPS graph cache pollution from variable-shape operations.
+        # Also cast to float32.
         if isinstance(preds, torch.Tensor) and preds.device.type == "mps":
-            preds = preds.cpu()
+            preds = preds.float().cpu() if preds.dtype == torch.float16 else preds.cpu()
         elif isinstance(preds, (list, tuple)) and len(preds) and isinstance(preds[0], torch.Tensor) and preds[0].device.type == "mps":
-            preds = type(preds)(p.cpu() if isinstance(p, torch.Tensor) else p for p in preds)
+            preds = type(preds)(
+                (p.float().cpu() if p.dtype == torch.float16 else p.cpu()) if isinstance(p, torch.Tensor) else p
+                for p in preds
+            )
         outputs = nms.non_max_suppression(
             preds,
             self.args.conf,
