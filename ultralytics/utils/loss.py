@@ -461,23 +461,25 @@ class v8DetectionLoss:
             preds["scores"].permute(0, 2, 1).contiguous(),
         )
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
-
+    
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
-
+    
         # Targets
         if self.device.type == "mps":
+            # Build targets on CPU and keep on CPU through preprocess to avoid redundant MPS round-trips
             targets = torch.cat((batch["batch_idx"].view(-1, 1).cpu(), batch["cls"].view(-1, 1).cpu(), batch["bboxes"].cpu()), 1)
+            targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         else:
             targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
-
+    
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-
+    
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -486,15 +488,15 @@ class v8DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
-
+    
         target_scores_sum = max(target_scores.sum(), 1)
-
+    
         # Cls loss with optional class weighting
         bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
         if self.class_weights is not None:
             bce_loss *= self.class_weights
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
-
+    
         # Bbox loss
         if fg_mask.sum():
             loss[0], loss[2] = self.bbox_loss(
@@ -508,7 +510,7 @@ class v8DetectionLoss:
                 imgsz,
                 stride_tensor,
             )
-
+    
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
@@ -517,7 +519,6 @@ class v8DetectionLoss:
             loss,
             loss.detach(),
         )  # loss(box, cls, dfl)
-
     def parse_output(
         self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
     ) -> torch.Tensor:
