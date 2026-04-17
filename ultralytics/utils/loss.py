@@ -406,7 +406,6 @@ class v8DetectionLoss:
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates.
-
         On MPS, all variable-shape scatter/index work runs on CPU to avoid multiplying
         the MPS graph cache. On other devices, uses the original on-device path.
         """
@@ -414,7 +413,7 @@ class v8DetectionLoss:
         if nl == 0:
             out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
         elif self.device.type == "mps":
-            # MPS path: do scatter on CPU with fixed max_boxes
+            # MPS path: do scatter on CPU with fixed max_boxes to stabilize shapes
             t = targets.cpu() if targets.device.type != "cpu" else targets
             batch_idx = t[:, 0].long()
             _, counts = batch_idx.unique(return_counts=True)
@@ -429,16 +428,16 @@ class v8DetectionLoss:
             out = out_cpu.to(self.device)
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         else:
-            # Original path: on-device scatter with dynamic counts.max()
-            i = targets[:, 0]  # image index
-            _, counts = i.unique(return_counts=True)
+            # Original path: on-device vectorized scatter with dynamic counts.max()
+            batch_idx = targets[:, 0].long()  # image index
+            _, counts = batch_idx.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, int(counts.max()), ne - 1, device=self.device)
-            for j in range(batch_size):
-                matches = i == j
-                n = matches.sum()
-                if n:
-                    out[j, :n] = targets[matches, 1:]
+            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
+            offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+            offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
+            offsets = offsets.cumsum(0)
+            within_idx = torch.arange(nl, device=self.device) - offsets[batch_idx]
+            out[batch_idx, within_idx] = targets[:, 1:]
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 
@@ -1051,14 +1050,13 @@ class v8OBBLoss(v8DetectionLoss):
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets for oriented bounding box detection.
-
         On MPS, all variable-shape scatter/index work runs on CPU to avoid multiplying
         the MPS graph cache. On other devices, uses the original on-device path.
         """
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 6, device=self.device)
         elif self.device.type == "mps":
-            # MPS path: do scatter on CPU with fixed max_boxes
+            # MPS path: do scatter on CPU with fixed max_boxes to stabilize shapes
             t = targets.cpu() if targets.device.type != "cpu" else targets
             batch_idx = t[:, 0].long()
             _, counts = batch_idx.unique(return_counts=True)
@@ -1074,17 +1072,18 @@ class v8OBBLoss(v8DetectionLoss):
             out_cpu[batch_idx, within_idx] = packed_targets
             out = out_cpu.to(self.device)
         else:
-            # Original path: on-device scatter
-            i = targets[:, 0]  # image index
-            _, counts = i.unique(return_counts=True)
+            # Original path: on-device vectorized scatter
+            batch_idx = targets[:, 0].long()  # image index
+            _, counts = batch_idx.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, int(counts.max()), 6, device=self.device)
-            for j in range(batch_size):
-                matches = i == j
-                n = matches.sum()
-                if n:
-                    out[j, :n] = targets[matches, 1:]
-            out[..., 1:5] *= scale_tensor
+            out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
+            packed_targets = targets[:, 1:].clone()
+            packed_targets[:, 1:5].mul_(scale_tensor)
+            offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+            offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
+            offsets = offsets.cumsum(0)
+            within_idx = torch.arange(len(targets), device=self.device) - offsets[batch_idx]
+            out[batch_idx, within_idx] = packed_targets
         return out
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
