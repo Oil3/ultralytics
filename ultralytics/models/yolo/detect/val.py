@@ -96,30 +96,25 @@ class DetectionValidator(BaseValidator):
         self.seen = 0
         self.jdict = []
         self.metrics.names = model.names
-        self.metrics.clear_stats()
-        self.metrics.clear_image_metrics()
         self.confusion_matrix = ConfusionMatrix(names=model.names, save_matches=self.args.plots and self.args.visualize)
 
     def get_desc(self) -> str:
         """Return a formatted string summarizing class metrics of YOLO model."""
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
+
     def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         """Apply Non-maximum suppression to prediction outputs.
+
         Args:
             preds (torch.Tensor): Raw predictions from the model.
+
         Returns:
             (list[dict[str, torch.Tensor]]): Processed predictions after NMS, where each dict contains 'bboxes', 'conf',
                 'cls', and 'extra' tensors.
         """
-        # Move to CPU before NMS to avoid MPS graph cache pollution from variable-shape operations.
-        # Also cast to float32.
-        if isinstance(preds, torch.Tensor) and preds.device.type == "mps":
-            preds = preds.float().cpu() if preds.dtype == torch.float16 else preds.cpu()
-        elif isinstance(preds, (list, tuple)) and len(preds) and isinstance(preds[0], torch.Tensor) and preds[0].device.type == "mps":
-            preds = type(preds)(
-                (p.float().cpu() if p.dtype == torch.float16 else p.cpu()) if isinstance(p, torch.Tensor) else p
-                for p in preds
-            )
+        _tc = lambda p: (p.float() if p.dtype == torch.float16 else p).cpu() if isinstance(p, torch.Tensor) else p  # MPS: run NMS on CPU, variable shapes pollute graph cache
+        if (isinstance(preds, torch.Tensor) and preds.device.type == "mps") or (isinstance(preds, (list, tuple)) and preds and isinstance(preds[0], torch.Tensor) and preds[0].device.type == "mps"):
+            preds = _tc(preds) if isinstance(preds, torch.Tensor) else type(preds)(_tc(p) for p in preds)
         outputs = nms.non_max_suppression(
             preds,
             self.args.conf,
@@ -180,11 +175,7 @@ class DetectionValidator(BaseValidator):
             preds (list[dict[str, torch.Tensor]]): List of predictions from the model.
             batch (dict[str, Any]): Batch data containing ground truth.
         """
-        # Move annotation tensors to CPU to avoid MPS graph cache pollution from variable-shape boolean indexing in _prepare_batch and box_iou in _process_batch, this runs after model.loss() which needs them on device.
-        if batch.get("batch_idx") is not None and batch["batch_idx"].device.type == "mps":
-            for k in ("batch_idx", "cls", "bboxes"):
-                if k in batch and isinstance(batch[k], torch.Tensor):
-                    batch[k] = batch[k].cpu()
+        if torch.is_tensor(batch.get("batch_idx")) and batch["batch_idx"].device.type == "mps": batch.update({k: batch[k].cpu() for k in ("batch_idx", "cls", "bboxes") if torch.is_tensor(batch.get(k))})  # MPS: boolean indexing + box_iou variable shapes
         for si, pred in enumerate(preds):
             self.seen += 1
             pbatch = self._prepare_batch(si, batch)
@@ -199,7 +190,6 @@ class DetectionValidator(BaseValidator):
                     "target_img": np.unique(cls),
                     "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
                     "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
-                    "im_name": Path(pbatch["im_file"]).name,
                 }
             )
             # Evaluate
@@ -233,19 +223,6 @@ class DetectionValidator(BaseValidator):
         self.metrics.confusion_matrix = self.confusion_matrix
         self.metrics.save_dir = self.save_dir
 
-    def _gather_image_metrics(self, metric) -> None:
-        """Gather per-image metrics from all GPUs for a single metric object."""
-        if RANK == 0:
-            gathered_image_metrics = [None] * dist.get_world_size()
-            dist.gather_object(metric.image_metrics, gathered_image_metrics, dst=0)
-            metric.clear_image_metrics()
-            for image_metrics in gathered_image_metrics:
-                if image_metrics:
-                    metric.image_metrics.update(image_metrics)
-        elif RANK > 0:
-            dist.gather_object(metric.image_metrics, None, dst=0)
-            metric.clear_image_metrics()
-
     def gather_stats(self) -> None:
         """Gather stats from all GPUs."""
         if RANK == 0:
@@ -261,12 +238,10 @@ class DetectionValidator(BaseValidator):
             for jdict in gathered_jdict:
                 self.jdict.extend(jdict)
             self.metrics.stats = merged_stats
-            self._gather_image_metrics(self.metrics.box)
             self.seen = len(self.dataloader.dataset)  # total image count from dataset
         elif RANK > 0:
             dist.gather_object(self.metrics.stats, None, dst=0)
             dist.gather_object(self.jdict, None, dst=0)
-            self._gather_image_metrics(self.metrics.box)
             self.jdict = []
             self.metrics.clear_stats()
 
