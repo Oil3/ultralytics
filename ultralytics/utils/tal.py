@@ -94,14 +94,7 @@ class TaskAlignedAssigner(nn.Module):
                 torch.zeros_like(pd_scores[..., 0]),
             )
 
-        if device.type == "mps":
-            # MPS: run assignment on CPU to avoid variable-shape MPS graph compilation
-            # from boolean indexing in get_box_metrics. Same pattern as OOM fallback below.
-            # Actually improves performance.
-            cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
-            result = self._forward(*cpu_tensors)
-            return tuple(t.to(device) for t in result)
-
+        if device.type == "mps": return tuple(t.to(device) for t in self._forward(*(x.cpu() for x in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt))))  # MPS: variable-shape ops in get_box_metrics pollute graph cache
         try:
             return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
         except RuntimeError as e:
@@ -180,10 +173,6 @@ class TaskAlignedAssigner(nn.Module):
     def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
         """Compute alignment metric given predicted and ground truth bounding boxes.
 
-        On MPS, uses full-tensor computation to avoid variable-shape tensors that
-        multiply the MPS graph/MLIR/shader caches. On other devices, uses the original
-        boolean-indexed version.
-
         Args:
             pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
             pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
@@ -197,13 +186,12 @@ class TaskAlignedAssigner(nn.Module):
         """
         na = pd_bboxes.shape[-2]
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
+        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
 
         ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
         ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
         ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-
-        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
-        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
         # Get the scores of each grid for each gt cls
         bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
 
