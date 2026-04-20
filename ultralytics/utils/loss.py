@@ -127,30 +127,19 @@ class BboxLoss(nn.Module):
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
-        _mps = pred_bboxes.device.type == "mps"
-        if _mps:
-            # MPS: run original loss on CPU to avoid variable-shape MPS graph compilation.
-            _dev = pred_bboxes.device
-            # Autograd tracks the .cpu() transfer — gradients flow back to MPS automatically.
-            pred_dist = pred_dist.cpu()
-            pred_bboxes = pred_bboxes.cpu()
-            anchor_points = anchor_points.cpu()
-            target_bboxes = target_bboxes.cpu()
-            target_scores = target_scores.cpu()
-            target_scores_sum = target_scores_sum.cpu() if isinstance(target_scores_sum, torch.Tensor) else target_scores_sum
-            fg_mask = fg_mask.cpu()
-            imgsz = imgsz.cpu()
-            stride = stride.cpu()
-
+        if (_dev := pred_bboxes.device).type == "mps": pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, fg_mask, imgsz, stride = (t.cpu() for t in (pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, fg_mask, imgsz, stride))  # MPS: variable-shape ops pollute graph cache
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
             loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
             target_ltrb = bbox2dist(anchor_points, target_bboxes)
+            # normalize ltrb by image size
             target_ltrb = target_ltrb * stride
             target_ltrb[..., 0::2] /= imgsz[1]
             target_ltrb[..., 1::2] /= imgsz[0]
@@ -162,11 +151,7 @@ class BboxLoss(nn.Module):
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
-        if _mps:
-            loss_iou = loss_iou.to(_dev)
-            loss_dfl = loss_dfl.to(_dev)
-
-        return loss_iou, loss_dfl
+        return (loss_iou.to(_dev), loss_dfl.to(_dev)) if _dev.type == "mps" else (loss_iou, loss_dfl)
 
 
 class RLELoss(nn.Module):
@@ -243,20 +228,7 @@ class RotatedBboxLoss(BboxLoss):
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for rotated bounding boxes."""
-        _mps = pred_bboxes.device.type == "mps"
-        if _mps:
-            _dev = pred_bboxes.device
-            # MPS: run original loss on CPU to avoid variable-shape MPS graph compilation.
-            pred_dist = pred_dist.cpu()
-            pred_bboxes = pred_bboxes.cpu()
-            anchor_points = anchor_points.cpu()
-            target_bboxes = target_bboxes.cpu()
-            target_scores = target_scores.cpu()
-            target_scores_sum = target_scores_sum.cpu() if isinstance(target_scores_sum, torch.Tensor) else target_scores_sum
-            fg_mask = fg_mask.cpu()
-            imgsz = imgsz.cpu()
-            stride = stride.cpu()
-
+        if (_dev := pred_bboxes.device).type == "mps": pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, fg_mask, imgsz, stride = (t.cpu() for t in (pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, fg_mask, imgsz, stride))  # MPS: see BboxLoss.forward
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
@@ -281,11 +253,7 @@ class RotatedBboxLoss(BboxLoss):
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
-        if _mps:
-            loss_iou = loss_iou.to(_dev)
-            loss_dfl = loss_dfl.to(_dev)
-
-        return loss_iou, loss_dfl
+        return (loss_iou.to(_dev), loss_dfl.to(_dev)) if _dev.type == "mps" else (loss_iou, loss_dfl)
 
 
 class MultiChannelDiceLoss(nn.Module):
@@ -399,41 +367,16 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
-    # In MPS, for the second dimension of the targets tensor in preprocess(, using a single constant eliminates all shape variation from the loss computation path, which otherwise causes unbounded memory growth via MPSGraphCache / MLIR BumpPtrAllocator / Metal shader caches (1 per shape!) — none of which can be flushed before process termination. Extra slots are zero-padded and masked by mask_gt.
-    # 512 should handle high after-mosaic-per-image ground truths.
-    # it corresponds to the 'instances' indicator stat of training; a batch with an instances' count greater than that will create its own cache like before.
-
-    FIXED_MAX_BOXES = 512
-    
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
-        """Preprocess targets by converting to tensor format and scaling coordinates.
-        On MPS, all variable-shape scatter/index work runs on CPU to avoid multiplying
-        the MPS graph cache. On other devices, uses the original on-device path.
-        """
+        """Preprocess targets by converting to tensor format and scaling coordinates."""
         nl, ne = targets.shape
         if nl == 0:
             out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
-        elif self.device.type == "mps":
-            # MPS path: do scatter on CPU with fixed max_boxes to stabilize shapes
-            t = targets.cpu() if targets.device.type != "cpu" else targets
-            batch_idx = t[:, 0].long()
-            _, counts = batch_idx.unique(return_counts=True)
-            counts = counts.to(dtype=torch.int32)
-            max_boxes = max(self.FIXED_MAX_BOXES, int(counts.max()))
-            out_cpu = torch.zeros(batch_size, max_boxes, ne - 1)
-            offsets = torch.zeros(batch_size + 1, dtype=torch.long)
-            offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
-            offsets = offsets.cumsum(0)
-            within_idx = torch.arange(nl) - offsets[batch_idx]
-            out_cpu[batch_idx, within_idx] = t[:, 1:]
-            out = out_cpu.to(self.device)
-            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         else:
-            # Original path: on-device vectorized scatter with dynamic counts.max()
             batch_idx = targets[:, 0].long()  # image index
             _, counts = batch_idx.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
+            out = torch.zeros(batch_size, max(int(counts.max()), 512) if self.device.type == "mps" else int(counts.max()), ne - 1, device=self.device)  # MPS: fixed bucket stabilizes graph cache
             offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
             offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
             offsets = offsets.cumsum(0)
@@ -461,25 +404,20 @@ class v8DetectionLoss:
             preds["scores"].permute(0, 2, 1).contiguous(),
         )
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
-    
+
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
-    
+
         # Targets
-        if self.device.type == "mps":
-            # Build targets on CPU and keep on CPU through preprocess to avoid redundant MPS round-trips
-            targets = torch.cat((batch["batch_idx"].view(-1, 1).cpu(), batch["cls"].view(-1, 1).cpu(), batch["bboxes"].cpu()), 1)
-            targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        else:
-            targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
-    
+
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-    
+
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -488,15 +426,15 @@ class v8DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
-    
+
         target_scores_sum = max(target_scores.sum(), 1)
-    
+
         # Cls loss with optional class weighting
         bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
         if self.class_weights is not None:
             bce_loss *= self.class_weights
         loss[1] = bce_loss.sum() / target_scores_sum  # BCE
-    
+
         # Bbox loss
         if fg_mask.sum():
             loss[0], loss[2] = self.bbox_loss(
@@ -510,7 +448,7 @@ class v8DetectionLoss:
                 imgsz,
                 stride_tensor,
             )
-    
+
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
@@ -519,6 +457,7 @@ class v8DetectionLoss:
             loss,
             loss.detach(),
         )  # loss(box, cls, dfl)
+
     def parse_output(
         self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
     ) -> torch.Tensor:
@@ -1051,34 +990,14 @@ class v8OBBLoss(v8DetectionLoss):
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
-        """Preprocess targets for oriented bounding box detection.
-        On MPS, all variable-shape scatter/index work runs on CPU to avoid multiplying
-        the MPS graph cache. On other devices, uses the original on-device path.
-        """
+        """Preprocess targets for oriented bounding box detection."""
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 6, device=self.device)
-        elif self.device.type == "mps":
-            # MPS path: do scatter on CPU with fixed max_boxes to stabilize shapes
-            t = targets.cpu() if targets.device.type != "cpu" else targets
-            batch_idx = t[:, 0].long()
-            _, counts = batch_idx.unique(return_counts=True)
-            counts = counts.to(dtype=torch.int32)
-            max_boxes = max(self.FIXED_MAX_BOXES, int(counts.max()))
-            out_cpu = torch.zeros(batch_size, max_boxes, 6)
-            packed_targets = t[:, 1:].clone()
-            packed_targets[:, 1:5].mul_(scale_tensor.cpu())
-            offsets = torch.zeros(batch_size + 1, dtype=torch.long)
-            offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
-            offsets = offsets.cumsum(0)
-            within_idx = torch.arange(len(t)) - offsets[batch_idx]
-            out_cpu[batch_idx, within_idx] = packed_targets
-            out = out_cpu.to(self.device)
         else:
-            # Original path: on-device vectorized scatter
             batch_idx = targets[:, 0].long()  # image index
             _, counts = batch_idx.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
+            out = torch.zeros(batch_size, max(int(counts.max()), 512) if self.device.type == "mps" else int(counts.max()), 6, device=self.device)  # MPS: fixed bucket stabilizes graph cache
             packed_targets = targets[:, 1:].clone()
             packed_targets[:, 1:5].mul_(scale_tensor)
             offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
